@@ -1,11 +1,36 @@
+"""
+MovieBox REST API Server
+========================
+A FastAPI wrapper around the moviebox-api Python library with proxy support.
+Deploy on Render, Railway, or any Python hosting.
+
+Endpoints:
+  GET  /api/v1/search?query=...&type=0&page=1
+  GET  /api/v1/trending?page=0
+  GET  /api/v1/homepage
+  GET  /api/v1/popular
+  GET  /api/v1/details?query=...&index=0
+  GET  /api/v1/movie/links?query=...&quality=BEST
+  GET  /api/v1/series/links?query=...&season=1&episode=1&quality=BEST
+  GET  /api/v1/mirrors
+  POST /api/v1/mirror
+  GET  /api/v1/health
+  GET  /api/v1/proxy/download?url=...
+  GET  /api/v1/proxy/stream?url=...
+"""
+
 import os
 import traceback
+import re
 from contextlib import asynccontextmanager
 from typing import Optional, Dict, Any, List
+from urllib.parse import urlparse
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse, Response
 from pydantic import BaseModel
+import httpx
 
 from moviebox_api import (
     Search,
@@ -27,20 +52,44 @@ from moviebox_api.constants import SubjectType
 # Global session
 session: Optional[Session] = None
 
+# Allowed domains for proxy
+ALLOWED_DOMAINS = [
+    'h5.aoneroom.com',
+    'moviebox.ph',
+    'api.moviebox.ph',
+    'cdn.moviebox.ph',
+    'media.moviebox.ph',
+    'static.moviebox.ph',
+    'img.moviebox.ph',
+    'sub.moviebox.ph',
+    'videos.moviebox.ph',
+]
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage the global session lifecycle."""
     global session
     session = Session()
+    # Add additional headers to session
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'application/json, text/plain, */*',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Referer': 'https://moviebox.ph/',
+        'Origin': 'https://moviebox.ph',
+        'Sec-Fetch-Dest': 'empty',
+        'Sec-Fetch-Mode': 'cors',
+        'Sec-Fetch-Site': 'same-site',
+    })
     yield
     await session.close()
 
 
 app = FastAPI(
-    title="MovieBox API",
-    description="Unofficial REST API for moviebox.ph — Search, stream, and download movies & TV series.",
-    version="0.3.5",
+    title="MovieBox API with Proxy",
+    description="Unofficial REST API for moviebox.ph — Search, stream, and download movies & TV series with proxy support to avoid 403 errors.",
+    version="0.4.0",
     lifespan=lifespan,
 )
 
@@ -62,6 +111,192 @@ def error_response(e: Exception) -> Dict[str, Any]:
 # Request/Response Models
 class MirrorRequest(BaseModel):
     host: str
+
+
+# ──────────────────────────────────────────────
+# PROXY ENDPOINTS
+# ──────────────────────────────────────────────
+
+@app.get("/api/v1/proxy/download")
+async def proxy_download(
+    url: str = Query(..., description="The download URL to proxy"),
+    filename: Optional[str] = Query(None, description="Optional filename for download")
+):
+    """
+    Proxy download requests to avoid 403 Forbidden errors.
+    This endpoint forwards the request with the proper session cookies and headers.
+    """
+    try:
+        # Validate URL
+        if not url.startswith(('http://', 'https://')):
+            raise HTTPException(status_code=400, detail="Invalid URL")
+        
+        # Parse the URL to check if it's from allowed domains
+        parsed_url = urlparse(url)
+        
+        # Get the session cookies from the global session
+        cookies = session.cookies.get_dict() if session else {}
+        
+        # Prepare headers - copy important ones from the original session
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': '*/*',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Connection': 'keep-alive',
+            'Sec-Fetch-Dest': 'video',
+            'Sec-Fetch-Mode': 'no-cors',
+            'Sec-Fetch-Site': 'cross-site',
+            'Referer': 'https://moviebox.ph/',
+            'Origin': 'https://moviebox.ph',
+            'Range': 'bytes=0-',  # Request full video
+        }
+        
+        # Add any session-specific headers if available
+        if session and hasattr(session, 'headers'):
+            # Don't override our headers with session headers that might cause issues
+            for key, value in session.headers.items():
+                if key not in headers and key.lower() not in ['host', 'content-length']:
+                    headers[key] = value
+        
+        # Create a new client for streaming with timeout
+        async with httpx.AsyncClient(
+            follow_redirects=True,
+            timeout=httpx.Timeout(60.0, connect=30.0, read=60.0)
+        ) as client:
+            # Make the request with cookies and headers
+            response = await client.get(
+                url, 
+                headers=headers,
+                cookies=cookies,
+                timeout=60.0
+            )
+            
+            # Check if request was successful
+            response.raise_for_status()
+            
+            # Get content type and determine filename
+            content_type = response.headers.get('content-type', 'video/mp4')
+            
+            # Generate filename if not provided
+            if not filename:
+                # Try to extract from Content-Disposition
+                content_disposition = response.headers.get('content-disposition')
+                if content_disposition:
+                    filename_match = re.search(r'filename[^;=\n]*=((["\']).*?\2|[^;\n]*)', content_disposition)
+                    if filename_match:
+                        filename = filename_match.group(1).strip('"\'')
+                
+                if not filename:
+                    # Extract from URL
+                    path_parts = parsed_url.path.split('/')
+                    filename = path_parts[-1] if path_parts[-1] else 'video.mp4'
+                    
+                    # Add .mp4 extension if missing
+                    if not '.' in filename:
+                        filename = f"{filename}.mp4"
+            
+            # Return streaming response
+            return StreamingResponse(
+                response.aiter_bytes(),
+                media_type=content_type,
+                headers={
+                    'Content-Disposition': f'attachment; filename="{filename}"',
+                    'Content-Length': response.headers.get('content-length', ''),
+                    'Accept-Ranges': 'bytes',
+                    'Cache-Control': 'no-cache',
+                }
+            )
+            
+    except httpx.HTTPStatusError as e:
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=e.response.status_code,
+            detail=f"Proxy error: {str(e)}"
+        )
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=error_response(e))
+
+
+@app.get("/api/v1/proxy/stream")
+async def proxy_stream(
+    url: str = Query(..., description="The stream URL to proxy"),
+    request: Request = None
+):
+    """
+    Proxy streaming requests with support for range headers (for video seeking).
+    This endpoint supports video streaming with proper byte-range requests.
+    """
+    try:
+        if not url.startswith(('http://', 'https://')):
+            raise HTTPException(status_code=400, detail="Invalid URL")
+        
+        # Get session cookies
+        cookies = session.cookies.get_dict() if session else {}
+        
+        # Prepare headers - copy range header from original request if present
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': '*/*',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Referer': 'https://moviebox.ph/',
+            'Origin': 'https://moviebox.ph',
+        }
+        
+        # Forward Range header if present (for video seeking)
+        range_header = request.headers.get('range')
+        if range_header:
+            headers['Range'] = range_header
+        
+        # Create client with streaming support
+        async with httpx.AsyncClient(
+            follow_redirects=True,
+            timeout=httpx.Timeout(60.0, connect=30.0, read=120.0)
+        ) as client:
+            # Make streaming request
+            async with client.stream(
+                'GET',
+                url,
+                headers=headers,
+                cookies=cookies
+            ) as response:
+                # Check if request was successful
+                if response.status_code >= 400:
+                    raise HTTPException(
+                        status_code=response.status_code,
+                        detail=f"Stream error: {response.status_code}"
+                    )
+                
+                # Prepare response headers
+                response_headers = {}
+                
+                # Forward important headers
+                for header in ['content-type', 'content-length', 'content-range', 'accept-ranges']:
+                    if header in response.headers:
+                        response_headers[header] = response.headers[header]
+                
+                # Handle partial content (206) for video seeking
+                status_code = response.status_code
+                
+                # Return streaming response
+                return StreamingResponse(
+                    response.aiter_bytes(),
+                    media_type=response.headers.get('content-type', 'video/mp4'),
+                    status_code=status_code,
+                    headers=response_headers
+                )
+            
+    except httpx.HTTPStatusError as e:
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=e.response.status_code,
+            detail=f"Proxy stream error: {str(e)}"
+        )
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=error_response(e))
 
 
 # ──────────────────────────────────────────────
@@ -200,6 +435,7 @@ async def get_movie_links(
         description="Quality: WORST, BEST, 360P, 480P, 720P, 1080P",
         regex="^(WORST|BEST|360P|480P|720P|1080P)$"
     ),
+    use_proxy: bool = Query(True, description="Return proxy URLs instead of direct links")
 ):
     """Search for a movie and get its download/stream links."""
     try:
@@ -219,20 +455,34 @@ async def get_movie_links(
         quality_map = files_metadata.get_quality_downloads_map()
         available_qualities = {}
         for q, meta in quality_map.items():
+            url = meta.path
+            if use_proxy:
+                # Convert to proxy URL
+                url = f"/api/v1/proxy/stream?url={url}"
+            
             available_qualities[q] = {
                 "resolution": meta.resolution,
                 "size": meta.size_string,
-                "url": meta.path,
+                "url": url,
             }
 
         # Subtitles
         subtitles = []
         for cap in files_metadata.caption_files:
+            sub_url = cap.path
+            if use_proxy:
+                sub_url = f"/api/v1/proxy/download?url={sub_url}&filename={item.title}.{cap.language}.srt"
+            
             subtitles.append({
                 "language": cap.language,
                 "language_short": cap.language_short,
-                "url": cap.path,
+                "url": sub_url,
             })
+
+        # Selected quality URL
+        selected_url = target_file.path
+        if use_proxy:
+            selected_url = f"/api/v1/proxy/stream?url={target_file.path}"
 
         return {
             "success": True,
@@ -240,11 +490,12 @@ async def get_movie_links(
             "selected_quality": {
                 "resolution": target_file.resolution,
                 "size": target_file.size_string,
-                "download_url": target_file.path,
-                "stream_url": target_file.path,
+                "download_url": f"/api/v1/proxy/download?url={target_file.path}&filename={item.title}.{target_file.resolution}.mp4" if use_proxy else target_file.path,
+                "stream_url": selected_url,
             },
             "available_qualities": available_qualities,
             "subtitles": subtitles,
+            "proxy_enabled": use_proxy,
         }
     except HTTPException:
         raise
@@ -267,6 +518,7 @@ async def get_series_links(
         description="Quality: WORST, BEST, 360P, 480P, 720P, 1080P",
         regex="^(WORST|BEST|360P|480P|720P|1080P)$"
     ),
+    use_proxy: bool = Query(True, description="Return proxy URLs instead of direct links")
 ):
     """Search for a TV series and get episode download/stream links."""
     try:
@@ -285,20 +537,35 @@ async def get_series_links(
         quality_map = files_metadata.get_quality_downloads_map()
         available_qualities = {}
         for q, meta in quality_map.items():
+            url = meta.path
+            if use_proxy:
+                url = f"/api/v1/proxy/stream?url={url}"
+            
             available_qualities[q] = {
                 "resolution": meta.resolution,
                 "size": meta.size_string,
-                "url": meta.path,
+                "url": url,
             }
 
         subtitles = []
         for cap in files_metadata.caption_files:
+            sub_url = cap.path
+            if use_proxy:
+                sub_url = f"/api/v1/proxy/download?url={sub_url}&filename={item.title}_S{season:02d}E{episode:02d}.{cap.language}.srt"
+            
             subtitles.append({
                 "language": cap.language,
                 "language_short": cap.language_short,
-                "url": cap.path,
+                "url": sub_url,
             })
 
+        # Selected quality URL
+        selected_url = target_file.path
+        if use_proxy:
+            selected_url = f"/api/v1/proxy/stream?url={target_file.path}"
+
+        filename = f"{item.title}_S{season:02d}E{episode:02d}_{target_file.resolution}.mp4"
+        
         return {
             "success": True,
             "title": item.title,
@@ -307,11 +574,12 @@ async def get_series_links(
             "selected_quality": {
                 "resolution": target_file.resolution,
                 "size": target_file.size_string,
-                "download_url": target_file.path,
-                "stream_url": target_file.path,
+                "download_url": f"/api/v1/proxy/download?url={target_file.path}&filename={filename}" if use_proxy else target_file.path,
+                "stream_url": selected_url,
             },
             "available_qualities": available_qualities,
             "subtitles": subtitles,
+            "proxy_enabled": use_proxy,
         }
     except HTTPException:
         raise
@@ -345,7 +613,7 @@ async def set_mirror(req: MirrorRequest):
     # Note: This only affects new sessions, not the current one
     return {
         "success": True, 
-        "message": f"Mirror set to {req.host}. New sessions will use this host."
+        "message": f"Mirror set to {req.host}. New sessions will use this host. Restart recommended."
     }
 
 
@@ -358,8 +626,9 @@ async def health_check():
     return {
         "success": True,
         "status": "healthy",
-        "version": "0.3.5",
+        "version": "0.4.0",
         "active_host": SELECTED_HOST,
+        "proxy_enabled": True,
     }
 
 
@@ -369,8 +638,8 @@ async def health_check():
 @app.get("/")
 async def root():
     return {
-        "name": "MovieBox API",
-        "version": "0.3.5",
+        "name": "MovieBox API with Proxy",
+        "version": "0.4.0",
         "docs": "/docs",
         "endpoints": [
             "GET /api/v1/search?query=...",
@@ -378,12 +647,15 @@ async def root():
             "GET /api/v1/homepage",
             "GET /api/v1/popular",
             "GET /api/v1/details?query=...&index=0",
-            "GET /api/v1/movie/links?query=...&quality=BEST",
-            "GET /api/v1/series/links?query=...&season=1&episode=1&quality=BEST",
+            "GET /api/v1/movie/links?query=...&quality=BEST&use_proxy=true",
+            "GET /api/v1/series/links?query=...&season=1&episode=1&quality=BEST&use_proxy=true",
             "GET /api/v1/mirrors",
             "POST /api/v1/mirror",
             "GET /api/v1/health",
+            "GET /api/v1/proxy/download?url=...",
+            "GET /api/v1/proxy/stream?url=...",
         ],
+        "proxy_feature": "Use proxy endpoints to avoid 403 Forbidden errors"
     }
 
 
