@@ -1,23 +1,4 @@
-"""
-MovieBox REST API Server
-========================
-A FastAPI wrapper around the moviebox-api Python library with proxy support.
-Deploy on Render, Railway, or any Python hosting.
 
-Endpoints:
-  GET  /api/v1/search?query=...&type=0&page=1
-  GET  /api/v1/trending?page=0
-  GET  /api/v1/homepage
-  GET  /api/v1/popular
-  GET  /api/v1/details?query=...&index=0
-  GET  /api/v1/movie/links?query=...&quality=BEST
-  GET  /api/v1/series/links?query=...&season=1&episode=1&quality=BEST
-  GET  /api/v1/mirrors
-  POST /api/v1/mirror
-  GET  /api/v1/health
-  GET  /api/v1/proxy/download?url=...
-  GET  /api/v1/proxy/stream?url=...
-"""
 
 import os
 import traceback
