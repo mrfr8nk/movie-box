@@ -33,6 +33,9 @@ from moviebox_api.constants import SubjectType
 # Global session
 session: Optional[Session] = None
 
+# HTTP client for proxy requests
+proxy_client: Optional[httpx.AsyncClient] = None
+
 # Allowed domains for proxy
 ALLOWED_DOMAINS = [
     'h5.aoneroom.com',
@@ -50,21 +53,30 @@ ALLOWED_DOMAINS = [
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage the global session lifecycle."""
-    global session
+    global session, proxy_client
+    
+    # Initialize moviebox-api session
     session = Session()
-    # Add additional headers to session
-    session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'application/json, text/plain, */*',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Referer': 'https://moviebox.ph/',
-        'Origin': 'https://moviebox.ph',
-        'Sec-Fetch-Dest': 'empty',
-        'Sec-Fetch-Mode': 'cors',
-        'Sec-Fetch-Site': 'same-site',
-    })
+    
+    # Initialize proxy HTTP client with default headers
+    proxy_client = httpx.AsyncClient(
+        follow_redirects=True,
+        timeout=httpx.Timeout(60.0, connect=30.0, read=120.0),
+        headers={
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'application/json, text/plain, */*',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Referer': 'https://moviebox.ph/',
+            'Origin': 'https://moviebox.ph',
+        }
+    )
+    
     yield
+    
+    # Cleanup
     await session.close()
+    if proxy_client:
+        await proxy_client.aclose()
 
 
 app = FastAPI(
@@ -116,31 +128,20 @@ async def proxy_download(
         parsed_url = urlparse(url)
         
         # Get the session cookies from the global session
-        cookies = session.cookies.get_dict() if session else {}
+        cookies = session.cookies.get_dict() if session and hasattr(session, 'cookies') else {}
         
-        # Prepare headers - copy important ones from the original session
+        # Prepare headers
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Accept': '*/*',
             'Accept-Language': 'en-US,en;q=0.9',
             'Accept-Encoding': 'gzip, deflate, br',
             'Connection': 'keep-alive',
-            'Sec-Fetch-Dest': 'video',
-            'Sec-Fetch-Mode': 'no-cors',
-            'Sec-Fetch-Site': 'cross-site',
             'Referer': 'https://moviebox.ph/',
             'Origin': 'https://moviebox.ph',
-            'Range': 'bytes=0-',  # Request full video
         }
         
-        # Add any session-specific headers if available
-        if session and hasattr(session, 'headers'):
-            # Don't override our headers with session headers that might cause issues
-            for key, value in session.headers.items():
-                if key not in headers and key.lower() not in ['host', 'content-length']:
-                    headers[key] = value
-        
-        # Create a new client for streaming with timeout
+        # Use the proxy client
         async with httpx.AsyncClient(
             follow_redirects=True,
             timeout=httpx.Timeout(60.0, connect=30.0, read=60.0)
@@ -214,7 +215,7 @@ async def proxy_stream(
             raise HTTPException(status_code=400, detail="Invalid URL")
         
         # Get session cookies
-        cookies = session.cookies.get_dict() if session else {}
+        cookies = session.cookies.get_dict() if session and hasattr(session, 'cookies') else {}
         
         # Prepare headers - copy range header from original request if present
         headers = {
@@ -227,9 +228,8 @@ async def proxy_stream(
         }
         
         # Forward Range header if present (for video seeking)
-        range_header = request.headers.get('range')
-        if range_header:
-            headers['Range'] = range_header
+        if request and request.headers.get('range'):
+            headers['Range'] = request.headers.get('range')
         
         # Create client with streaming support
         async with httpx.AsyncClient(
@@ -642,9 +642,11 @@ async def root():
 
 if __name__ == "__main__":
     import uvicorn
+    port = int(os.getenv("PORT", 8000))
+    print(f"Starting server on port {port}...")
     uvicorn.run(
         "main:app", 
         host="0.0.0.0", 
-        port=int(os.getenv("PORT", 8000)), 
+        port=port, 
         reload=os.getenv("ENV") == "development"
     )
